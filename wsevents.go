@@ -28,7 +28,7 @@ type EventPackage struct {
 
 type EventManager struct {
 	eventHandlers []chan EventPackage
-	websockets   map[int]*websocket.Conn
+	websockets    map[int]*websocket.Conn
 	transfers     map[int]chan *EventPackage
 	blockers      map[int]chan byte
 	rLock         sync.WaitGroup
@@ -115,7 +115,7 @@ func (em *EventManager) Transfer(id int, dest *EventManager) {
 
 	em.sendEvent(&EventPackage{
 		id,
-		"TRANSFER",
+		"TRANSFEERED",
 		map[string]interface{}{
 			"Id":           newId,
 			"EventManager": dest,
@@ -158,7 +158,8 @@ func (em *EventManager) listen(ws *websocket.Conn, id int) {
 		input.Id = id
 
 		// The outside world should not fire buildin events
-		if (input.Event == "TRANSFER") || (input.Event == "DISCONNECT") {
+		switch input.Event {
+		case "TRANSFERRED", "CONNECTED", "DISCONNECTED":
 			input.Event = strings.ToLower(input.Event)
 		}
 
@@ -176,7 +177,7 @@ func (em *EventManager) listen(ws *websocket.Conn, id int) {
 
 	ws.Close()
 	delete(em.websockets, id)
-	em.sendEvent(&EventPackage{id, "DISCONNECT", err})
+	em.sendEvent(&EventPackage{id, "DISCONNECTED", err})
 	em.blockers[id] <- 1 //Unblock to allow main ws handler to exit
 	delete(em.blockers, id)
 }
@@ -207,6 +208,7 @@ func (em *EventManager) addWebsocket(ws *websocket.Conn) int {
 
 	em.websockets[id] = ws
 	em.blockers[id] = make(chan byte, 1)
+	em.sendEvent(&EventPackage{id, "CONNECTED", nil})
 
 	return id
 }
