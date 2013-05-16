@@ -115,7 +115,7 @@ func (em *EventManager) Transfer(id int, dest *EventManager) {
 
 	em.sendEvent(&EventPackage{
 		id,
-		"TRANSFEERED",
+		"TRANSFERRED",
 		map[string]interface{}{
 			"Id":           newId,
 			"EventManager": dest,
