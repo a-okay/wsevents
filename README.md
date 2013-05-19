@@ -45,7 +45,7 @@ Removing a Event- or HandlerChannel:
     EventManager.Unregister(HandlerChannel)
 
 ## Known issues / Fixme
----
+
 * If a handler changes the EventPackage obtained trough its channel other handlers might be affected.
 * To much use of mutexes. Could probably be changed to "share by communicating".
 * Add RegisterEvent to example.go

@@ -56,8 +56,9 @@ func handler(c chan *wsevents.EventPackage, other *wsevents.EventManager) {
 		  * When a new websocket is registerd a CONNECTED event is fired.
 		  * When a websocket is closed a DISCONECTED event is fired with the error in EventData.
 		  * When a websocket has been transfered a TANSFERRED event is fired. EventData contains a map with the new id (newId)
-		  * When registered handlers(wsevents.RegisterHandler)
-		  and a pointer to the new EventManager (dest).
+		    and a pointer to the new EventManager (dest).
+		  * When all registered handlers(wsevents.RegisterHandler) do EventPackage.Handled(false) the event is seen as unhandled
+		    and the DEFAULT event is fired. EventData contains a pointer to the original EventPackage.
 		*/
 		switch pack.Event {
 		// Broadcast the received string unsing EventManager.Dispatch(d Dispatcher)
