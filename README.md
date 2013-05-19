@@ -12,35 +12,35 @@ Use the go *get* tool to download and install. If you have not already done so f
 
 ### For a working example see example/example.go...
 
-Obtaining an EventMager:
+Obtaining an EventManager:
 
-    var EventManager \*wsEvents.EventManagerwsevents.NewEventManager()
+    var EventManager *wsevents.EventManager = wsevents.NewEventManager()
 
 Start listening for incomming events on a websocket:
 
-    func wsHandler(ws \*websocket.Conn) {
+    func wsHandler(ws *websocket.Conn) {
         EventManager.Listen()
     }
 
 Obtaining a channel for a single event (Mostly used in OO):
 
-    var EventChannel chan \*EventPackage = EventManager.RegisterEvent("EventName")
+    var EventChannel chan *EventPackage = EventManager.RegisterEvent("EventName")
 
 Obtaining a channel that receives all events:
 
-    var HandlerChannel chan \*EventPackage = EventManager.RegisterHandler()
+    var HandlerChannel chan *EventPackage = EventManager.RegisterHandler()
 
 Sending something to a specific websocket:
 
     pack <- EventChannel
     pack.EventManager.Send(pack.Id, "Some Message")
 
-Sending something to all (Or selection defined by Dispatcher.Match) websockets in EventManager:
+Sending something to all (Or selection created by Dispatcher.Match) websockets in EventManager:
 
     pack <- EventChannel
-    pack.EventManager.Dispatch(pack) // EventPackage implements Dispatcher interface
+    pack.EventManager.Dispatch(pack) // *EventPackage implements Dispatcher interface
 
-Removing a Event- or HandlerChannel:
+Removing an Event- or HandlerChannel:
 
     EventManager.Unregister(HandlerChannel)
 
