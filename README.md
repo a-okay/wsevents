@@ -19,7 +19,7 @@ Obtaining an EventManager:
 Start listening for incomming events on a websocket:
 
     func wsHandler(ws *websocket.Conn) {
-        EventManager.Listen()
+        EventManager.Listen(ws)
     }
 
 Obtaining a channel for a single event (Mostly used in OO):
@@ -48,4 +48,3 @@ Removing an Event- or HandlerChannel:
 
 * If a handler changes the EventPackage obtained trough its channel other handlers might be affected.
 * To much use of mutexes. Could probably be changed to "share by communicating".
-* Add RegisterEvent to example.go

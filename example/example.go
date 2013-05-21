@@ -15,14 +15,14 @@ import (
 // Listen on port 80 by default
 var port *int = flag.Int("p", 80, "Port to listen.")
 
-// Instanciate two EventManagers
+// Instantiate  two EventManagers
 var EventManager1 *wsevents.EventManager = wsevents.NewEventManager()
 var EventManager2 *wsevents.EventManager = wsevents.NewEventManager()
 
 // Implements interface Dispatcher
 type broadcast string
 
-// Decide to which connection we have to send our package, in this case all.
+// Decide to which websocket we want to send our package, in this case all.
 func (bc *broadcast) Match(id int) bool {
 	return true
 }
@@ -39,6 +39,8 @@ func (bc *broadcast) BuildPackage(id int) interface{} {
 // Handle errors...
 func (bc *broadcast) Error(err error, pack interface{}) {}
 
+// EventHandler, all events go trough here.
+// Use this method only when you need fine graned controle or handle a lot of events in a sigle place.
 func handler(c chan *wsevents.EventPackage, other *wsevents.EventManager) {
 	for {
 		handled := true
@@ -92,6 +94,21 @@ func handler(c chan *wsevents.EventPackage, other *wsevents.EventManager) {
 	}
 }
 
+// EventHandler for a single event.
+// This is the recommended over the single handler for all events.
+func single(c chan *wsevents.EventPackage) {
+	for {
+		pack, ok := <-c
+
+		// Channel was closed, should only happen when EventManager.Unregister(c) is called.
+		if !ok {
+			return
+		}
+
+		pack.EventManager.Send(pack.Id, pack.BuildPackage(pack.Id))
+	}
+}
+
 func main() {
 	// Get commandline options
 	flag.Parse()
@@ -99,6 +116,7 @@ func main() {
 	// Register the handlers, EventManager.Register() returns a new chan wsevents.EventPackage
 	go handler(EventManager1.RegisterHandler(), EventManager2)
 	go handler(EventManager2.RegisterHandler(), EventManager1)
+	go single(EventManager1.RegisterEvent("single"))
 
 	fmt.Printf("http://127.0.0.1:%d/\n\n", *port)
 
