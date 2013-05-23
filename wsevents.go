@@ -1,4 +1,4 @@
-// Copyright 2013 The Karel van IJperen. All rights reserved.
+// Copyright 2013 Karel van IJperen. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
@@ -36,9 +36,7 @@ type EventManager struct {
 	websockets    map[int]*websocket.Conn
 	transfers     map[int]chan *EventPackage
 	blockers      map[int]chan byte
-	eventMutex    sync.RWMutex // For eventHandlers & events
-	wsMutex       sync.RWMutex // For websockets & blockers
-	transferMutex sync.RWMutex
+	mutex       sync.RWMutex
 }
 
 // Constructor
@@ -58,7 +56,7 @@ func NewEventManager() (em *EventManager) {
 func eventHandler(c chan *EventPackage) {
 	for {
 		pack := <-c
-		pack.EventManager.eventMutex.RLock()
+		pack.EventManager.mutex.RLock()
 		if channels, ok := pack.EventManager.events[pack.Event]; ok {
 			pack.Handled(true)
 
@@ -72,14 +70,14 @@ func eventHandler(c chan *EventPackage) {
 			pack.Handled(false)
 		}
 
-		pack.EventManager.eventMutex.RUnlock()
+		pack.EventManager.mutex.RUnlock()
 	}
 }
 
 // Register eventhandler
 func (em *EventManager) RegisterHandler() (receiver chan *EventPackage) {
-	em.eventMutex.Lock()
-	defer em.eventMutex.Unlock()
+	em.mutex.Lock()
+	defer em.mutex.Unlock()
 
 	receiver = make(chan *EventPackage, 50)
 	em.eventHandlers = append(em.eventHandlers, receiver)
@@ -88,6 +86,9 @@ func (em *EventManager) RegisterHandler() (receiver chan *EventPackage) {
 
 // Register event
 func (em *EventManager) RegisterEvent(eventName string) (receiver chan *EventPackage) {
+	em.mutex.Lock()
+	defer em.mutex.Unlock()
+
 	channels, ok := em.events[eventName]
 
 	// Allocate space for the new channel in slice
@@ -106,8 +107,8 @@ func (em *EventManager) RegisterEvent(eventName string) (receiver chan *EventPac
 
 // Remove eventhandler
 func (em *EventManager) Unregister(receiver chan *EventPackage) {
-	em.eventMutex.Lock()
-	defer em.eventMutex.Unlock()
+	em.mutex.Lock()
+	defer em.mutex.Unlock()
 
 	// Remove eventHandler
 	for i, c := range em.eventHandlers {
@@ -140,21 +141,18 @@ func (em *EventManager) Unregister(receiver chan *EventPackage) {
 
 // Register and linsten on websocket
 func (em *EventManager) Listen(ws *websocket.Conn) {
+	em.mutex.Lock()
 	id := em.addWebsocket(ws)
+	blocker := em.blockers[id]
+	em.mutex.Unlock()
 	em.listen(ws, id) // cal the actual listerer
-
-	em.wsMutex.RLock()
-	blocker, ok := em.blockers[id]
-	em.wsMutex.RUnlock()
-	if ok {
-		<-blocker
-	}
+	<-blocker
 }
 
 // Send something to multiple connections
 func (em *EventManager) Dispatch(d Dispatcher) {
-	em.wsMutex.RLock()
-	defer em.wsMutex.RUnlock()
+	em.mutex.RLock()
+	defer em.mutex.RUnlock()
 
 	for id, ws := range em.websockets {
 		if d.Match(id) {
@@ -172,8 +170,8 @@ func (em *EventManager) Dispatch(d Dispatcher) {
 
 // Send something to single connection
 func (em *EventManager) Send(id int, pack interface{}) (err error) {
-	em.wsMutex.RLock()
-	defer em.wsMutex.RUnlock()
+	em.mutex.RLock()
+	defer em.mutex.RUnlock()
 
 	err = ErrConnNotFound
 
@@ -186,14 +184,16 @@ func (em *EventManager) Send(id int, pack interface{}) (err error) {
 
 // Transfer connection to dest EventManager
 func (em *EventManager) Transfer(id int, dest *EventManager) {
-	em.transferMutex.Lock()
-	em.transfers[id] = make(chan *EventPackage)
-	em.transferMutex.Unlock()
+	em.mutex.Lock()
+	dest.mutex.Lock()
+	defer dest.mutex.Unlock()
+	defer em.mutex.Unlock()
 
-	em.wsMutex.RLock()
+	c := make(chan *EventPackage)
+	em.transfers[id] = c
+
 	newId := dest.addWebsocket(em.websockets[id])
 	ws := em.websockets[id]
-	em.wsMutex.RUnlock()
 
 	em.sendEvent(&EventPackage{
 		Id:    id,
@@ -206,28 +206,19 @@ func (em *EventManager) Transfer(id int, dest *EventManager) {
 		handled:      true,
 	})
 
-	em.wsMutex.Lock()
 	delete(em.websockets, id)
-	em.wsMutex.Unlock()
-	dest.wsMutex.Lock()
 	dest.blockers[newId] = em.blockers[id]
-	dest.wsMutex.Unlock()
+	delete(em.blockers, id)
 
 	// Wait for incomming package and than transfer listener
 	go func() {
-		em.transferMutex.RLock()
-		c := em.transfers[id]
-		em.transferMutex.RUnlock()
 		lastEvent := <-c
 		lastEvent.Id = newId
 		lastEvent.EventManager = dest
 
-		em.wsMutex.Lock()
-		delete(em.blockers, id)
-		em.wsMutex.Unlock()
-		em.transferMutex.Lock()
+		em.mutex.Lock()
 		delete(em.transfers, id)
-		em.transferMutex.Unlock()
+		em.mutex.Unlock()
 
 		dest.sendEvent(lastEvent)
 		dest.listen(ws, newId)
@@ -284,9 +275,8 @@ func (em *EventManager) listen(ws *websocket.Conn, id int) {
 		err = websocket.JSON.Receive(ws, input)
 		input.Id = id
 		input.EventManager = em
-		em.eventMutex.RLock()
+		em.mutex.RLock()
 		input.handlerCount = len(em.eventHandlers)
-		em.eventMutex.RUnlock()
 
 		// The outside world should not fire buildin events
 		switch input.Event {
@@ -295,10 +285,9 @@ func (em *EventManager) listen(ws *websocket.Conn, id int) {
 		}
 
 		// Check for connection transfer
-		em.transferMutex.RLock()
 		transfer, ok := em.transfers[id]
-		em.transferMutex.RUnlock()
 		if ok {
+			em.mutex.RUnlock()
 			transfer <- input
 			return
 		}
@@ -306,13 +295,15 @@ func (em *EventManager) listen(ws *websocket.Conn, id int) {
 		if err == nil {
 			em.sendEvent(input)
 		}
+		em.mutex.RUnlock()
 	}
 
-	em.wsMutex.Lock()
+	em.mutex.Lock()
+	defer em.mutex.Unlock()
+
 	delete(em.websockets, id)
 	em.blockers[id] <- 1 //Unblock to allow main ws handler to exit
 	delete(em.blockers, id)
-	em.wsMutex.Unlock()
 
 	em.sendEvent(&EventPackage{
 		Id:           id,
@@ -325,35 +316,28 @@ func (em *EventManager) listen(ws *websocket.Conn, id int) {
 
 // Sending the eventPackage to the registed channels
 func (em *EventManager) sendEvent(pack *EventPackage) {
-	em.eventMutex.RLock()
-	defer em.eventMutex.RUnlock()
-
 	for _, handler := range em.eventHandlers {
-		handler <- pack
+		go func() {
+			handler <- pack
+		}()
 	}
 }
 
 // Register the new websocket
 func (em *EventManager) addWebsocket(ws *websocket.Conn) int {
-	em.wsMutex.Lock()
 	id := len(em.websockets)
 	_, ok := em.websockets[id]
 
 	for ok {
 		id += 1
-
-		em.transferMutex.RLock()
 		for _, inTransit := em.transfers[id]; inTransit; _, inTransit = em.transfers[id] {
 			id += 1
 		}
-		em.transferMutex.RUnlock()
-
 		_, ok = em.websockets[id]
 	}
 
 	em.websockets[id] = ws
 	em.blockers[id] = make(chan byte, 1)
-	em.wsMutex.Unlock()
 	em.sendEvent(&EventPackage{
 		Id:           id,
 		Event:        "CONNECTED",
