@@ -30,199 +30,297 @@ type EventPackage struct {
 	counterMutex sync.Mutex
 }
 
+type TransferData struct {
+	Id   int
+	Src  *EventManager
+	Dest *EventManager
+}
+
 type EventManager struct {
+	eventHandler
 	eventHandlers []chan *EventPackage
-	events        map[string][]chan *EventPackage
-	websockets    map[int]*websocket.Conn
-	transfers     map[int]chan *EventPackage
-	blockers      map[int]chan byte
-	mutex       sync.RWMutex
+	connections   map[int]*connectionData
+	// Command channels
+	addConnection     chan *connectionData
+	removeConnection  chan int
+	registerHandler   chan chan *EventPackage
+	unregisterHandler chan chan *EventPackage
+	sendEvent         chan *EventPackage
+	send              chan *sendData
+	dispatch          chan Dispatcher
+	transfer          chan *TransferData
+}
+
+type eventHandler struct {
+	events map[string][]chan *EventPackage
+	// Command channels
+	registerEvent   chan *eventData
+	unregisterEvent chan chan *EventPackage
+}
+
+type connectionData struct {
+	ws        *websocket.Conn
+	incomming chan *EventPackage
+	stop      chan byte
+	td        *TransferData
+}
+
+type sendData struct {
+	id   int
+	pack interface{}
+	err  chan error
+}
+
+type eventData struct {
+	eventName string
+	receiver  chan *EventPackage
 }
 
 // Constructor
-func NewEventManager() (em *EventManager) {
-	em = &EventManager{
-		events:     make(map[string][]chan *EventPackage),
-		websockets: make(map[int]*websocket.Conn),
-		transfers:  make(map[int]chan *EventPackage),
-		blockers:   make(map[int]chan byte),
+func NewEventManager() (m *EventManager) {
+	m = &EventManager{
+		connections:       make(map[int]*connectionData),
+		addConnection:     make(chan *connectionData, 10),
+		removeConnection:  make(chan int, 10),
+		registerHandler:   make(chan chan *EventPackage, 10),
+		unregisterHandler: make(chan chan *EventPackage, 10),
+		sendEvent:         make(chan *EventPackage, 10),
+		send:              make(chan *sendData, 10),
+		dispatch:          make(chan Dispatcher, 10),
+		transfer:          make(chan *TransferData, 10),
 	}
-	go eventHandler(em.RegisterHandler())
+
+	m.eventHandler = eventHandler{
+		events:          make(map[string][]chan *EventPackage),
+		registerEvent:   make(chan *eventData, 10),
+		unregisterEvent: make(chan chan *EventPackage, 10),
+	}
+
+	go m.worker()
+	go m.eventHandler.worker(m.RegisterHandler())
 
 	return
 }
 
-// Sending the eventPackage to the registed channels in events
-func eventHandler(c chan *EventPackage) {
-	for {
-		pack := <-c
-		pack.EventManager.mutex.RLock()
-		if channels, ok := pack.EventManager.events[pack.Event]; ok {
-			pack.Handled(true)
+// Add connection and listen on websocket for incomming events
+func (m *EventManager) Listen(ws *websocket.Conn) (err error) {
+	c := make(chan *EventPackage, 10)
+	m.addConnection <- &connectionData{
+		ws:        ws,
+		incomming: c,
+	}
 
-			for _, channel := range channels {
-				go func() {
-					channel <- pack
-					//Fixme: handle closed channels e.g. unregisterd event handlers
-				}()
-			}
-		} else {
-			pack.Handled(false)
+	for err == nil {
+		pack := new(EventPackage)
+		err = websocket.JSON.Receive(ws, pack)
+
+		if err == nil {
+			c <- pack
 		}
+	}
 
-		pack.EventManager.mutex.RUnlock()
+	close(c)
+	return
+}
+
+// Coupling mechanism between Listen and EventManager
+func (m *EventManager) incommingHandler(id int, incomming chan *EventPackage, stop chan byte) {
+	for {
+		select {
+		case <-stop:
+			return
+		case pack, ok := <-incomming:
+			if !ok {
+				m.removeConnection <- id
+				<-stop // Make sure we read stop
+				return
+			}
+
+			// The outside world should not fire buildin events
+			switch pack.Event {
+			case "TRANSFERRED", "CONNECTED", "DISCONNECTED", "DEFAULT":
+				pack.Event = strings.ToLower(pack.Event)
+			}
+
+			pack.Id = id
+			pack.EventManager = m
+			m.sendEvent <- pack
+		}
 	}
 }
 
-// Register eventhandler
-func (em *EventManager) RegisterHandler() (receiver chan *EventPackage) {
-	em.mutex.Lock()
-	defer em.mutex.Unlock()
-
-	receiver = make(chan *EventPackage, 50)
-	em.eventHandlers = append(em.eventHandlers, receiver)
+func (m *EventManager) RegisterHandler() (receiver chan *EventPackage) {
+	receiver = make(chan *EventPackage, 10)
+	m.registerHandler <- receiver
 	return
+}
+
+func (m *EventManager) Unregister(receiver chan *EventPackage) {
+	m.unregisterHandler <- receiver
+	m.unregisterEvent <- receiver
+}
+
+func (m *EventManager) Send(id int, pack interface{}) (err error) {
+	errChan := make(chan error)
+	m.send <- &sendData{
+		id:   id,
+		pack: pack,
+		err:  errChan,
+	}
+
+	return <-errChan
+}
+
+// Send something to multiple connections
+func (m *EventManager) Dispatch(d Dispatcher) {
+	m.dispatch <- d
+}
+
+// Transfer connection to dest
+func (m *EventManager) Transfer(id int, dest *EventManager) {
+	m.transfer <- &TransferData{id, m, dest}
+}
+
+// Listen on command channels
+func (m *EventManager) worker() {
+	for{
+		select {
+		case conn := <-m.addConnection:
+			m.addConn(conn)
+		case id := <-m.removeConnection:
+			m.rmConn(id)
+		case receiver := <-m.registerHandler:
+			m.eventHandlers = append(m.eventHandlers, receiver)
+		case receiver := <-m.unregisterHandler:
+			for i, c := range m.eventHandlers {
+				if receiver == c {
+					m.eventHandlers[i], m.eventHandlers = m.eventHandlers[len(m.eventHandlers)-1], m.eventHandlers[:len(m.eventHandlers)-1]
+					close(c)
+				}
+			}
+		case pack := <-m.sendEvent:
+			pack.handlerCount = len(m.eventHandlers)
+			for _, handler := range m.eventHandlers {
+				go func(handler chan *EventPackage) {
+					handler <- pack
+				}(handler)
+			}
+		case sd := <-m.send:
+			err := ErrConnNotFound
+
+			if conn, ok := m.connections[sd.id]; ok {
+				err = websocket.JSON.Send(conn.ws, sd.pack)
+			}
+			sd.err <- err
+		case d := <-m.dispatch:
+			for id, conn := range m.connections {
+				if d.Match(id) {
+					go func(id int, conn *connectionData) {
+						pack := d.BuildPackage(id)
+						err := websocket.JSON.Send(conn.ws, pack)
+						if err != nil {
+							d.Error(err, pack)
+						}
+					}(id, conn)
+				}
+			}
+		case td := <-m.transfer:
+			conn := m.connections[td.Id]
+			conn.td = td
+			conn.stop <- 1
+			conn.td.Dest.addConnection <- conn
+			delete(m.connections, td.Id)
+		}
+	}
+}
+
+func (m *EventManager) addConn(conn *connectionData) {
+	conn.stop = make(chan byte)
+	id := len(m.connections)
+	for ok := true; ok; id += 1 {
+		_, ok = m.connections[id]
+	}
+
+	m.connections[id] = conn
+	go m.incommingHandler(id, conn.incomming, conn.stop)
+	m.sendEvent <- &EventPackage{
+		Id:           id,
+		Event:        "CONNECTED",
+		EventManager: m,
+		EventData:    conn.td,
+		handled:      true,
+	}
+	if conn.td != nil {
+		conn.td.Dest.sendEvent <- &EventPackage{
+			Id:           id,
+			Event:        "TRANSFERRED",
+			EventData:    conn.td,
+			EventManager: m,
+			handled:      true,
+		}
+	}
+}
+
+func (m *EventManager) rmConn(id int) {
+	m.connections[id].stop <- 1
+		m.sendEvent <- &EventPackage{
+			Id:           id,
+			Event:        "DISCONNECTED",
+			EventManager: m,
+			EventData:    m.connections[id].ws.Close(),
+			handled:      true,
+		}
+	delete(m.connections, id)
+}
+
+func (h *eventHandler) worker(incomming chan *EventPackage) {
+	for {
+		select {
+		case ed := <-h.registerEvent:
+			h.events[ed.eventName] = append(h.events[ed.eventName], ed.receiver)
+		case receiver := <-h.unregisterEvent:
+			h.unregEvent(receiver)
+		case pack := <-incomming:
+			if channels, ok := h.events[pack.Event]; ok {
+				pack.Handled(true)
+
+				for _, channel := range channels {
+					go func(channel chan *EventPackage) {
+						channel <- pack
+					}(channel)
+				}
+			} else {
+				pack.Handled(false)
+			}
+		}
+	}
 }
 
 // Register event
-func (em *EventManager) RegisterEvent(eventName string) (receiver chan *EventPackage) {
-	em.mutex.Lock()
-	defer em.mutex.Unlock()
-
-	channels, ok := em.events[eventName]
-
-	// Allocate space for the new channel in slice
-	if ok == false {
-		channels = make([]chan *EventPackage, 1)
-	} else {
-		channels = append(channels, make(chan *EventPackage, 1))
-	}
-
-	receiver = make(chan *EventPackage, 50) // Create the channel
-	channels[len(channels)-1] = receiver
-	em.events[eventName] = channels // Add the new slice to the map
-
+func (h *eventHandler) RegisterEvent(eventName string) (receiver chan *EventPackage) {
+	receiver = make(chan *EventPackage, 10) // Create the channel
+	h.registerEvent <- &eventData{eventName, receiver}
 	return
 }
 
-// Remove eventhandler
-func (em *EventManager) Unregister(receiver chan *EventPackage) {
-	em.mutex.Lock()
-	defer em.mutex.Unlock()
-
-	// Remove eventHandler
-	for i, c := range em.eventHandlers {
-		if receiver == c {
-			em.eventHandlers[i], em.eventHandlers = em.eventHandlers[len(em.eventHandlers)-1], em.eventHandlers[:len(em.eventHandlers)-1]
-			close(c)
-			return
-		}
-	}
-
-	// Remove event
-	for event, channels := range em.events {
+func (h *eventHandler) unregEvent(receiver chan *EventPackage) {
+	for eventName, channels := range h.events {
 		// if last handler in event
 		if (len(channels) == 1) && (receiver == channels[0]) {
 			close(channels[0])
-			delete(em.events, event)
+			delete(h.events, eventName)
 			return
 		} //else
 
 		for i, c := range channels {
 			if receiver == c {
 				channels[i], channels = channels[len(channels)-1], channels[:len(channels)-1]
-				em.events[event] = channels
+				h.events[eventName] = channels
 				close(c)
 				return
 			}
 		}
 	}
-}
-
-// Register and linsten on websocket
-func (em *EventManager) Listen(ws *websocket.Conn) {
-	em.mutex.Lock()
-	id := em.addWebsocket(ws)
-	blocker := em.blockers[id]
-	em.mutex.Unlock()
-	em.listen(ws, id) // cal the actual listerer
-	<-blocker
-}
-
-// Send something to multiple connections
-func (em *EventManager) Dispatch(d Dispatcher) {
-	em.mutex.RLock()
-	defer em.mutex.RUnlock()
-
-	for id, ws := range em.websockets {
-		if d.Match(id) {
-			go func() {
-				pack := d.BuildPackage(id)
-				err := websocket.JSON.Send(ws, pack)
-
-				if err != nil {
-					d.Error(err, pack)
-				}
-			}()
-		}
-	}
-}
-
-// Send something to single connection
-func (em *EventManager) Send(id int, pack interface{}) (err error) {
-	em.mutex.RLock()
-	defer em.mutex.RUnlock()
-
-	err = ErrConnNotFound
-
-	if ws, ok := em.websockets[id]; ok {
-		err = websocket.JSON.Send(ws, pack)
-	}
-
-	return
-}
-
-// Transfer connection to dest EventManager
-func (em *EventManager) Transfer(id int, dest *EventManager) {
-	em.mutex.Lock()
-	dest.mutex.Lock()
-	defer dest.mutex.Unlock()
-	defer em.mutex.Unlock()
-
-	c := make(chan *EventPackage)
-	em.transfers[id] = c
-
-	newId := dest.addWebsocket(em.websockets[id])
-	ws := em.websockets[id]
-
-	em.sendEvent(&EventPackage{
-		Id:    id,
-		Event: "TRANSFERRED",
-		EventData: map[string]interface{}{
-			"Id":           newId,
-			"EventManager": dest,
-		},
-		EventManager: em,
-		handled:      true,
-	})
-
-	delete(em.websockets, id)
-	dest.blockers[newId] = em.blockers[id]
-	delete(em.blockers, id)
-
-	// Wait for incomming package and than transfer listener
-	go func() {
-		lastEvent := <-c
-		lastEvent.Id = newId
-		lastEvent.EventManager = dest
-
-		em.mutex.Lock()
-		delete(em.transfers, id)
-		em.mutex.Unlock()
-
-		dest.sendEvent(lastEvent)
-		dest.listen(ws, newId)
-	}()
 }
 
 // Indicate wether we handled the event Should only(and always) be called by registered event handlers.
@@ -237,13 +335,13 @@ func (pack *EventPackage) Handled(handled bool) {
 	}
 
 	if !pack.handled && (pack.handlerCount == 0) {
-		pack.EventManager.sendEvent(&EventPackage{
+		pack.EventManager.sendEvent <- &EventPackage{
 			Id:           pack.Id,
 			Event:        "DEFAULT",
 			EventData:    pack,
 			EventManager: pack.EventManager,
 			handled:      true,
-		})
+		}
 	}
 }
 
@@ -263,87 +361,3 @@ func (pack *EventPackage) BuildPackage(id int) interface{} {
 
 // Implement Dispatcher.Error
 func (pack *EventPackage) Error(err error, dataSend interface{}) {}
-
-/* Private methods */
-
-// The actual listener
-func (em *EventManager) listen(ws *websocket.Conn, id int) {
-	var err error
-
-	for err == nil {
-		input := new(EventPackage)
-		err = websocket.JSON.Receive(ws, input)
-		input.Id = id
-		input.EventManager = em
-		em.mutex.RLock()
-		input.handlerCount = len(em.eventHandlers)
-
-		// The outside world should not fire buildin events
-		switch input.Event {
-		case "TRANSFERRED", "CONNECTED", "DISCONNECTED", "DEFAULT":
-			input.Event = strings.ToLower(input.Event)
-		}
-
-		// Check for connection transfer
-		transfer, ok := em.transfers[id]
-		if ok {
-			em.mutex.RUnlock()
-			transfer <- input
-			return
-		}
-
-		if err == nil {
-			em.sendEvent(input)
-		}
-		em.mutex.RUnlock()
-	}
-
-	em.mutex.Lock()
-	defer em.mutex.Unlock()
-
-	delete(em.websockets, id)
-	em.blockers[id] <- 1 //Unblock to allow main ws handler to exit
-	delete(em.blockers, id)
-
-	em.sendEvent(&EventPackage{
-		Id:           id,
-		Event:        "DISCONNECTED",
-		EventData:    err,
-		EventManager: em,
-		handled:      true,
-	})
-}
-
-// Sending the eventPackage to the registed channels
-func (em *EventManager) sendEvent(pack *EventPackage) {
-	for _, handler := range em.eventHandlers {
-		go func() {
-			handler <- pack
-		}()
-	}
-}
-
-// Register the new websocket
-func (em *EventManager) addWebsocket(ws *websocket.Conn) int {
-	id := len(em.websockets)
-	_, ok := em.websockets[id]
-
-	for ok {
-		id += 1
-		for _, inTransit := em.transfers[id]; inTransit; _, inTransit = em.transfers[id] {
-			id += 1
-		}
-		_, ok = em.websockets[id]
-	}
-
-	em.websockets[id] = ws
-	em.blockers[id] = make(chan byte, 1)
-	em.sendEvent(&EventPackage{
-		Id:           id,
-		Event:        "CONNECTED",
-		EventManager: em,
-		handled:      true,
-	})
-
-	return id
-}
